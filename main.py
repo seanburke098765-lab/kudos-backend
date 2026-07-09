@@ -1,42 +1,51 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from pydantic import BaseModel
-from typing import List
-import sqlite3
+from datetime import datetime, timedelta
+from typing import Dict
 
-# Initialize DB
-conn = sqlite3.connect("kudos.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS interactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        host_device TEXT,
-        guest_device TEXT,
-        timestamp TEXT
-    )
-""")
-conn.commit()
+app = FastAPI(title="Kudos Backend Ecosystem")
+router = APIRouter(prefix="/api/v1", tags=["sync"])
 
-app = FastAPI()
+class SyncPayload(BaseModel):
+    device_id: str
+    rssi: int
+    name: str
+    current_user_id: str
+    gesture_triggered: bool
 
-class Interaction(BaseModel):
-    guest_device_uuid: str
-    interacted_at: str
+# Stores valid kinetic handshakes: { user_id: { spotted_device_id: timestamp } }
+validated_matches: Dict[str, Dict[str, datetime]] = {}
 
-class SyncRequest(BaseModel):
-    host_device_uuid: str
-    interactions: List[Interaction]
+MATCH_WINDOW_SECONDS = 5
 
-@app.post("/api/v1/sync")
-async def sync_kudos(payload: SyncRequest):
-    for item in payload.interactions:
-        cursor.execute(
-            "INSERT INTO interactions (host_device, guest_device, timestamp) VALUES (?, ?, ?)",
-            (payload.host_device_uuid, item.guest_device_uuid, item.interacted_at)
-        )
-    conn.commit()
-    return {"status": "success"}
+@router.post("/sync")
+async def sync_device(payload: SyncPayload):
+    now = datetime.utcnow()
+    user_id = payload.current_user_id
+    spotted_id = payload.device_id
 
-@app.get("/api/v1/kudos")
-def get_kudos():
-    cursor.execute("SELECT * FROM interactions")
-    return {"data": cursor.fetchall()}
+    # If local accelerometer hasn't fired yet, just log a quiet scanning trace
+    if not payload.gesture_triggered:
+        return {"status": "scanning", "message": "Proximity logged, awaiting local gesture confirmation."}
+
+    # Record that THIS user performed the gesture targeting the spotted device
+    if user_id not in validated_matches:
+        validated_matches[user_id] = {}
+    validated_matches[user_id][spotted_id] = now
+
+    # Check for the reciprocal gesture validation window
+    if spotted_id in validated_matches and user_id in validated_matches[spotted_id]:
+        peer_gesture_time = validated_matches[spotted_id][user_id]
+        
+        # Core Verification: Did both trigger actions within 5 seconds of each other?
+        if now - peer_gesture_time <= timedelta(seconds=MATCH_WINDOW_SECONDS):
+            print(f"\n[MATCH VERIFIED] Successful Kudos exchange between {user_id} and {spotted_id}!\n")
+            return {
+                "status": "SUCCESS_MATCH_VERIFIED",
+                "peer_id": spotted_id,
+                "message": "Kudos profile exchange successful!"
+            }
+
+    return {"status": "pending_peer_gesture", "message": "Your gesture logged. Waiting for peer device action."}
+
+app.include_router(router)
